@@ -16,24 +16,30 @@ func main() {
 
 	goroutine := 50
 	p := pool.New(uint64(goroutine))
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second * 20)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
 	go func() {
 		if err := p.RunWithContext(ctx); err != nil {
-			panic(err)
+			p.Close()
+			fmt.Println(err)
+			// panic(err)
 		}
 	}()
+	// p.Run()
 
 	taskNum := 10000
 	go func() {
+		var err error
 		for i := 0; i < taskNum; i++ {
-			p.AddTaskHandler(func(i int, n *uint64) pool.HandlerFunc {
+			if err = p.AddTaskHandler(func(i int, n *uint64) pool.HandlerFunc {
 				return func() error {
 					time.Sleep(time.Millisecond * 50)
 					atomic.AddUint64(n, 1)
 					return nil
 				}
-			}(i, &n))
+			}(i, &n)); err != nil {
+				panic(err)
+			}
 		}
 		p.CloseTask()
 	}()
@@ -52,12 +58,14 @@ func main() {
 				maxGoroutineQuantity = goroutineQuantity
 			}
 			fmt.Printf(
-				"\rcurrent goruntine quantity: %d, max current goruntine quantity: %d, amount completed: %d\033[K",
+				"\rcurrent goroutine quantity: %d, max current goroutine quantity: %d, process: %d / %d\033[K",
 				goroutineQuantity,
 				maxGoroutineQuantity,
 				atomic.LoadUint64(&n),
+				taskNum,
 			)
 		case <-closeChan:
+			fmt.Printf("\nprocess: %d / %d\n", atomic.LoadUint64(&n), taskNum)
 			return
 		}
 	}

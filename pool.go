@@ -4,7 +4,7 @@ import "context"
 
 // 协程池
 type Pool struct {
-	capacity       synchronizeUint64
+	capacity       synchronizeCapacity
 	runningWorkers synchronizeUint64
 	closeChan      chan struct{}
 	taskChan       chan HandlerFunc
@@ -15,26 +15,32 @@ type Pool struct {
 // 初始化协程池，capacity为协程池初始容量
 // 实例代码：
 // p := New(10)
-// 值得注意的，协程池中协程的数量仅受控于capacity，而不受task数量的影响。如需要通过剩余task数控制协程池的容量，请通过协程池的方法自行实现
+// 值得注意:
+// 1. 协程池中协程的数量仅受控于capacity，而不受task数量的影响。如需要通过剩余task数控制协程池的容量，请通过协程池的方法自行实现
+// 2. 任务通道的缓存大小与初始化协程数一致，暂不支持自定义缓存大小
 func New(capacity uint64) *Pool {
 	return &Pool{
-		capacity:  synchronizeUint64(capacity),
-		closeChan: make(chan struct{}, capacity),
-		taskChan:  make(chan HandlerFunc, capacity),
-		errorChan: make(chan error),
+		capacity:   newCapacity(capacity),
+		closeChan:  make(chan struct{}, capacity),
+		taskChan:   make(chan HandlerFunc, capacity),
+		errorChan:  make(chan error),
 	}
 }
 
 // 向线程池添加任务
-func (p *Pool) AddTask(task Task) {
-	p.AddTaskHandler(func() error {
+func (p *Pool) AddTask(task Task) error {
+	return p.AddTaskHandler(func() error {
 		return task.Handler(task.Params...)
 	})
 }
 
 // 向线程池添加任务处理函数
-func (p *Pool) AddTaskHandler(handlerFunc HandlerFunc) {
+func (p *Pool) AddTaskHandler(handlerFunc HandlerFunc) error {
+	if p.isTaskClose.Value() {
+		return ErrTaskChannelIsClosed
+	}
 	p.taskChan <- handlerFunc
+	return nil
 }
 
 // 获取剩余任务数，可在外部通过获取该值动态改变协程池的容量
@@ -45,21 +51,25 @@ func (p *Pool) RemainingTaskQuantity() int {
 // 修改协程池的容量
 func (p *Pool) UpdateWorkerQuantity(quantity uint64) {
 	p.capacity.Store(quantity)
+	// p.updateChan <- struct{}{}
 }
 
 // 容量增加一
 func (p *Pool) IncWorker() {
 	p.capacity.Add(1)
+	// p.updateChan <- struct{}{}
 }
 
 // 容量减少一
 func (p *Pool) DecWorker() {
 	p.capacity.Add(^uint64(0))
+	// p.updateChan <- struct{}{}
 }
 
 // 运行协程池
 func (p *Pool) Run() {
 	go p.dynamic()
+	// p.updateChan <- struct{}{}
 }
 
 // 使用上下文运行协程池
@@ -74,8 +84,9 @@ func (p *Pool) ListenClose() chan struct{} {
 	c := make(chan struct{})
 	go func() {
 		for {
-			if p.isTaskClose.Load() && len(p.taskChan) == 0 && p.runningWorkers == 0 {
+			if p.isTaskClose.Value() && len(p.taskChan) == 0 && p.runningWorkers.Value() == 0 {
 				c <- struct{}{}
+				return
 			}
 		}
 	}()
@@ -87,13 +98,13 @@ func (p *Pool) Wait() {
 	<-p.ListenClose()
 }
 
-// 关闭协程池
+// 关闭协程池，协程池需要手动进行关闭
 func (p *Pool) Close() {
 	p.CloseTask()
-	p.capacity.Store(0)
+	p.UpdateWorkerQuantity(0)
 }
 
-// 关闭任务通道，当任务通道关闭后，所有任务均处理完成后，协程池将自动关闭
+// 关闭任务通道
 func (p *Pool) CloseTask() {
 	close(p.taskChan)
 	p.isTaskClose.Store(true)
@@ -102,16 +113,19 @@ func (p *Pool) CloseTask() {
 // 通过监听容量的变化实时修改当前协程数量
 func (p *Pool) dynamic() {
 	for {
-		runningWorkers := p.runningWorkers.Load()
-		capacity := p.capacity.Load()
-		switch {
-		case runningWorkers < capacity:
-			for i := 0; i < int(capacity-runningWorkers); i++ {
-				p.run()
-			}
-		case runningWorkers > capacity:
-			for i := 0; i < int(runningWorkers-capacity); i++ {
-				p.closeChan <- struct{}{}
+		select {
+		case <- p.capacity.eventChan:
+			runningWorkers := p.runningWorkers.Value()
+			capacity := p.capacity.Value()
+			switch {
+			case runningWorkers < capacity:
+				for i := 0; i < int(capacity-runningWorkers); i++ {
+					p.run()
+				}
+			case runningWorkers > capacity:
+				for i := 0; i < int(runningWorkers-capacity); i++ {
+					p.closeChan <- struct{}{}
+				}
 			}
 		}
 	}
